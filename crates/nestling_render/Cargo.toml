@@ -1,0 +1,8 @@
+[package]
+name = "nestling_render"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bevy_ecs = "0.15.0"
+wgpu = "23.0.1"

@@ -1,0 +1,8 @@
+workspace = {members = ["crates/*"]}
+[package]
+name = "bevy_nestling"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nestling_render = {path = "crates/nestling_render"}
