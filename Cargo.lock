@@ -747,6 +747,7 @@ name = "nestling_render"
 version = "0.1.0"
 dependencies = [
  "bevy_ecs",
+ "log",
  "wgpu",
 ]
 

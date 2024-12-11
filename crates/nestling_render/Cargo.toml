@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 bevy_ecs = "0.15.0"
 wgpu = "23.0.1"
+log = "0.4.22"

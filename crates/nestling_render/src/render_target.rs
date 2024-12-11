@@ -1,11 +1,11 @@
 use bevy_ecs::component::Component;
+use log::warn;
 use wgpu::{
-    Color, CommandEncoder, Device, Extent3d, LoadOp, Operations, PresentMode, RenderPass,
+    Adapter, Color, CommandEncoder, Device, Extent3d, LoadOp, Operations, PresentMode, RenderPass,
     RenderPassColorAttachment, RenderPassDepthStencilAttachment, RenderPassDescriptor, StoreOp,
-    SurfaceConfiguration, SurfaceTexture, Texture, TextureDescriptor, TextureFormat, TextureUsages,
-    TextureView, TextureViewDescriptor,
+    Surface, SurfaceCapabilities, SurfaceConfiguration, SurfaceTexture, Texture, TextureDescriptor,
+    TextureFormat, TextureUsages, TextureView, TextureViewDescriptor,
 };
-
 #[derive(Clone, PartialEq)]
 pub struct RenderTargetDepthStencilConfig {
     /// The clear depth of the render target
@@ -72,7 +72,7 @@ impl Default for RenderTargetColorConfig {
 /// The built-in [RenderTarget]s are [OffscreenRenderTarget], where all buffers are optional, and [SurfaceRenderTarget] that requires a color buffer.
 /// I cannot imagine needing any other implementations than the two built-ins.
 pub trait RenderTarget {
-    /// The size of the textures
+    /// The size of the textures, might be 0 on a [SurfaceRenderTarget] if not initialized
     fn size(&self) -> (u32, u32);
     /// Sample count of the internal Texture, will be 1 if not multisampled
     fn sample_count(&self) -> u32;
@@ -107,7 +107,7 @@ pub trait RenderTarget {
     /// Get a mutable reference to the scheduled depth/stencil config, is there are no scheduled changes a copy of the current config will be scheduled.
     /// Will only be [None] if there is no depth/stencil config at all.
     fn scheduled_depth_stencil_config_mut(&mut self)
-        -> Option<&mut RenderTargetDepthStencilConfig>;
+                                          -> Option<&mut RenderTargetDepthStencilConfig>;
     /// Sets the scheduled depth/stencil config, this config will be applied based on the implementor.
     fn set_scheduled_depth_stencil_config(&mut self, config: RenderTargetDepthStencilConfig);
     /// Set the scheduled clear color of the render target, if no color buffer is used this will do nothing.
@@ -139,6 +139,8 @@ pub trait RenderTarget {
     ) -> RenderPass<'a>;
 }
 
+// This is where the somewhat good code ends
+
 /// Some of the functions of [RenderTarget] can be implemented with the others.
 /// I could have made an extension trait, but [OffscreenRenderTarget] and [SurfaceRenderTarget] are probably the only types to implement [RenderTarget].
 /// For that reason I would rather have the library be cleaner on the outside.
@@ -157,7 +159,7 @@ trait RenderTargetImpl {
     fn current_depth_stencil_config(&self) -> Option<&RenderTargetDepthStencilConfig>;
     fn scheduled_depth_stencil_config(&self) -> Option<&RenderTargetDepthStencilConfig>;
     fn scheduled_depth_stencil_config_mut(&mut self)
-        -> Option<&mut RenderTargetDepthStencilConfig>;
+                                          -> Option<&mut RenderTargetDepthStencilConfig>;
     fn set_scheduled_depth_stencil_config(&mut self, config: RenderTargetDepthStencilConfig);
     fn schedule_clear_color(&mut self);
     fn schedule_clear_depth(&mut self);
@@ -435,6 +437,20 @@ impl OffscreenRenderTarget {
         self.scheduled_config_mut().size = size;
     }
 
+    /// Remove the color texture when changes are applied
+    pub fn remove_color(&mut self) {
+        self.scheduled_config
+            .as_mut()
+            .map(|c| c.color_config.take());
+    }
+
+    /// Remove the depth/stencil texture when changes are applied
+    pub fn remove_depth_stencil(&mut self) {
+        self.scheduled_config
+            .as_mut()
+            .map(|c| c.depth_stencil_config.take());
+    }
+
     // TODO run automatically in system
     /// Applies the scheduled changes, this might replace the textures and thereby clear them
     pub fn apply_changes(&mut self, device: Device) {
@@ -443,25 +459,11 @@ impl OffscreenRenderTarget {
             return;
         }
         let (color_changed, multisample_changed, depth_stencil_changed) = changes;
+        if let Some(cfg) = self.scheduled_config.take() {
+            self.current_config = Some(cfg);
+        }
         let (width, height) = <Self as RenderTarget>::size(self);
-        let mut desc = TextureDescriptor {
-            label: None,
-            size: Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: TextureFormat::Rgba8UnormSrgb,
-            usage: TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        };
-        let with_view = |t: Texture| {
-            let v = t.create_view(&TextureViewDescriptor::default());
-            (t, v)
-        };
+        let mut desc = texture_descriptor(width, height);
         if color_changed {
             let mut mt = self.multisampled_texture.take();
             // funky map abuse
@@ -513,11 +515,11 @@ impl OffscreenRenderTarget {
 
     /// Helper for scheduling changes
     fn scheduled_config_mut(&mut self) -> &mut OffscreenRenderTargetConfig {
-        self.scheduled_config.get_or_insert(
+        self.scheduled_config.get_or_insert_with(|| {
             self.current_config
                 .clone()
-                .expect("no scheduled or current config"),
-        )
+                .expect("no scheduled or current config")
+        })
     }
 }
 
@@ -634,6 +636,7 @@ impl RenderTargetImpl for OffscreenRenderTarget {
     }
 }
 
+#[derive(Clone)]
 pub struct SurfaceRenderTargetConfig {
     /// Color config of the surface, not optional, as a surface always has a color component
     pub color_config: RenderTargetColorConfig,
@@ -658,4 +661,317 @@ impl Default for SurfaceRenderTargetConfig {
             backup_present_mode: None,
         }
     }
+}
+
+#[derive(Component)]
+pub struct SurfaceRenderTarget {
+    current_config: Option<SurfaceRenderTargetConfig>,
+    scheduled_config: Option<SurfaceRenderTargetConfig>,
+    //TODO HMM, sus
+    surface: Option<Surface<'static>>,
+    surface_capabilities: Option<SurfaceCapabilities>,
+    size: (u32, u32),
+
+    color_texture: Option<(SurfaceTexture, TextureView)>,
+    multisampled_texture: Option<(Texture, TextureView)>,
+    depth_stencil_texture: Option<(Texture, TextureView)>,
+
+    resolve_scheduled: bool,
+    clear_color_scheduled: bool,
+    clear_depth_scheduled: bool,
+    clear_stencil_scheduled: bool,
+}
+
+impl SurfaceRenderTarget {
+    pub fn new(config: SurfaceRenderTargetConfig) -> Self {
+        Self {
+            current_config: None,
+            scheduled_config: Some(config),
+            surface: None,
+            surface_capabilities: None,
+            size: (0, 0),
+            color_texture: None,
+            multisampled_texture: None,
+            depth_stencil_texture: None,
+            resolve_scheduled: false,
+            clear_color_scheduled: false,
+            clear_depth_scheduled: false,
+            clear_stencil_scheduled: false,
+        }
+    }
+
+    /// The desired max frame latency of the [SurfaceConfiguration]
+    pub fn max_frame_latency(&self) -> u32 {
+        self.current_or_scheduled_config()
+            .desired_maximum_frame_latency
+    }
+
+    /// The [PresentMode] of the [SurfaceConfiguration]
+    pub fn present_mode(&self) -> PresentMode {
+        self.current_or_scheduled_config().present_mode
+    }
+
+    /// The backup [PresentMode] used if the primary isn't available for the [SurfaceConfiguration]
+    pub fn backup_present_mode(&self) -> Option<PresentMode> {
+        self.current_or_scheduled_config().backup_present_mode
+    }
+
+    /// Sets the scheduled desired max frame latency of the [SurfaceConfiguration]
+    pub fn set_max_frame_latency(&mut self, max_frame_latency: u32) {
+        self.scheduled_config_mut().desired_maximum_frame_latency = max_frame_latency;
+    }
+
+    /// Sets the scheduled present mode of the [SurfaceConfiguration]
+    pub fn set_present_mode(&mut self, present_mode: PresentMode) {
+        self.scheduled_config_mut().present_mode = present_mode;
+    }
+
+    /// Sets scheduled backup for the present mode of the [SurfaceConfiguration]
+    pub fn set_backup_present_mode(&mut self, backup_present_mode: Option<PresentMode>) {
+        self.scheduled_config_mut().backup_present_mode = backup_present_mode;
+    }
+
+    /// Remove the depth/stencil texture when changes are applied
+    pub fn remove_depth_stencil(&mut self) {
+        self.scheduled_config
+            .as_mut()
+            .map(|c| c.depth_stencil_config.take());
+    }
+    // TODO run automatically in system
+    /// Inits the [SurfaceRenderTarget], should be called once before [SurfaceRenderTarget] is used
+    /// [SurfaceRenderTarget::update] should also be called before use
+    pub fn init(&mut self, surface: Surface<'static>, adapter: &Adapter) {
+        self.surface_capabilities = Some(surface.get_capabilities(adapter));
+        self.surface = Some(surface);
+    }
+
+    // TODO run in system
+    /// Applies the scheduled changes, and updates [SurfaceTexture] this might replace the textures and thereby clear them
+    pub fn update(&mut self, device: &Device, win_size: (u32, u32)) {
+        // yuck, maybe rewrite in the future?
+        // probably not happening
+        if self.surface.is_none() {
+            warn!("Tried to update uninitialized SurfaceRenderTarget");
+            return;
+        }
+        let (color_changed, multisampled_changed, depth_stencil_changed) = self.changes();
+        let resized = self.size != win_size;
+        self.size = win_size;
+        if let Some(cfg) = self.scheduled_config.take() {
+            self.current_config = Some(cfg);
+        }
+        let surface = self.surface.as_mut().unwrap();
+        let tex = surface.get_current_texture();
+        let cfg = self.current_config.as_ref().unwrap();
+        if color_changed || resized {
+            let caps = self.surface_capabilities.as_ref().unwrap();
+            let surface_cfg = SurfaceConfiguration {
+                usage: cfg.color_config.usages | TextureUsages::RENDER_ATTACHMENT,
+                format: match cfg.color_config.format_override {
+                    None => *caps
+                        .formats
+                        .iter()
+                        .find(|f| f.is_srgb())
+                        .expect("no srgb on surface :("),
+                    Some(f) => f,
+                },
+                width: win_size.0,
+                height: win_size.1,
+                present_mode: if caps.present_modes.contains(&cfg.present_mode) {
+                    cfg.present_mode
+                } else {
+                    cfg.backup_present_mode
+                        .expect("present mode not available, and backup not set")
+                },
+                desired_maximum_frame_latency: cfg.desired_maximum_frame_latency,
+                alpha_mode: Default::default(),
+                view_formats: Vec::new(),
+            };
+            surface.configure(
+                &device,
+                &surface_cfg,
+            );
+            if multisampled_changed {
+                self.multisampled_texture = cfg.color_config.multisample_config.as_ref().map(|m| {
+                    let mut desc = texture_descriptor(win_size.0, win_size.1);
+                    desc.format = surface_cfg.format;
+                    desc.sample_count = m.sample_count;
+                    with_view(device.create_texture(&desc))
+                });
+            }
+        }
+        if let Ok(tex) = tex {
+            let view = tex.texture.create_view(&Default::default());
+            self.color_texture = Some((tex, view));
+        } else {
+            self.color_texture = None;
+            return;
+        }
+        if depth_stencil_changed || resized {
+            self.depth_stencil_texture = cfg.depth_stencil_config.as_ref().map(|ds_cfg| {
+                let mut desc = texture_descriptor(win_size.0, win_size.1);
+                desc.format = ds_cfg.format;
+                desc.usage |= ds_cfg.usages;
+                with_view(device.create_texture(&desc))
+            })
+        }
+    }
+
+    fn changes(&self) -> (bool, bool, bool) {
+        if self.current_config.is_none() {
+            return (true, true, true);
+        }
+        if self.scheduled_config.is_none() {
+            return (false, false, false);
+        }
+        let cur = self.current_config.as_ref().unwrap();
+        let new = self.scheduled_config.as_ref().unwrap();
+        (
+            cur.color_config != new.color_config,
+            cur.color_config.multisample_config != new.color_config.multisample_config,
+            cur.depth_stencil_config != new.depth_stencil_config,
+        )
+    }
+
+    fn scheduled_config_mut(&mut self) -> &mut SurfaceRenderTargetConfig {
+        self.scheduled_config.get_or_insert_with(|| {
+            self.current_config
+                .as_ref()
+                .expect("no scheduled or current config")
+                .clone()
+        })
+    }
+
+    fn current_or_scheduled_config(&self) -> &SurfaceRenderTargetConfig {
+        self.current_config
+            .as_ref()
+            .or(self.scheduled_config.as_ref())
+            .expect("no scheduled or current config")
+    }
+}
+
+// Crimes against DRY
+// Sorry
+impl RenderTargetImpl for SurfaceRenderTarget {
+    fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
+    fn texture(&self) -> Option<&Texture> {
+        self.color_texture.as_ref().map(|(c, _)| &c.texture)
+    }
+
+    fn texture_view(&self) -> Option<&TextureView> {
+        self.color_texture.as_ref().map(|(_, v)| v)
+    }
+
+    fn multisampled_view(&self) -> Option<&TextureView> {
+        self.multisampled_texture.as_ref().map(|(_, v)| v)
+    }
+
+    fn depth_stencil(&self) -> Option<&Texture> {
+        self.depth_stencil_texture.as_ref().map(|(t, _)| t)
+    }
+
+    fn depth_stencil_view(&self) -> Option<&TextureView> {
+        self.depth_stencil_texture.as_ref().map(|(_, v)| v)
+    }
+
+    fn current_color_config(&self) -> Option<&RenderTargetColorConfig> {
+        self.current_config.as_ref().map(|c| &c.color_config)
+    }
+
+    fn scheduled_color_config(&self) -> Option<&RenderTargetColorConfig> {
+        self.scheduled_config.as_ref().map(|c| &c.color_config)
+    }
+
+    fn scheduled_color_config_mut(&mut self) -> Option<&mut RenderTargetColorConfig> {
+        Some(&mut self.scheduled_config_mut().color_config)
+    }
+
+    fn set_scheduled_color_config(&mut self, config: RenderTargetColorConfig) {
+        self.scheduled_config_mut().color_config = config;
+    }
+
+    fn current_depth_stencil_config(&self) -> Option<&RenderTargetDepthStencilConfig> {
+        self.current_config
+            .as_ref()
+            .map(|c| c.depth_stencil_config.as_ref())?
+    }
+
+    fn scheduled_depth_stencil_config(&self) -> Option<&RenderTargetDepthStencilConfig> {
+        self.scheduled_config
+            .as_ref()
+            .map(|c| c.depth_stencil_config.as_ref())?
+    }
+
+    fn scheduled_depth_stencil_config_mut(
+        &mut self,
+    ) -> Option<&mut RenderTargetDepthStencilConfig> {
+        self.scheduled_config_mut().depth_stencil_config.as_mut()
+    }
+
+    fn set_scheduled_depth_stencil_config(&mut self, config: RenderTargetDepthStencilConfig) {
+        self.scheduled_config_mut().depth_stencil_config = Some(config);
+    }
+
+    fn schedule_clear_color(&mut self) {
+        self.clear_color_scheduled = true;
+    }
+
+    fn schedule_clear_depth(&mut self) {
+        self.clear_depth_scheduled = true;
+    }
+
+    fn schedule_clear_stencil(&mut self) {
+        self.clear_stencil_scheduled = true;
+    }
+
+    fn schedule_resolve(&mut self) {
+        self.resolve_scheduled = true;
+    }
+
+    fn scheduled_resolve(&self) -> bool {
+        self.resolve_scheduled
+    }
+
+    fn clearing(&self) -> (bool, bool, bool) {
+        (
+            self.clear_color_scheduled,
+            self.clear_depth_scheduled,
+            self.clear_stencil_scheduled,
+        )
+    }
+
+    fn pass_created(&mut self) {
+        self.clear_color_scheduled = false;
+        self.clear_depth_scheduled = false;
+        self.clear_stencil_scheduled = false;
+    }
+
+    fn unschedule_resolve(&mut self) {
+        self.resolve_scheduled = false;
+    }
+}
+
+fn texture_descriptor(width: u32, height: u32) -> TextureDescriptor<'static> {
+    TextureDescriptor {
+        label: None,
+        size: Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: TextureFormat::Rgba8UnormSrgb,
+        usage: TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    }
+}
+
+fn with_view(t: Texture) -> (Texture, TextureView) {
+    let v = t.create_view(&TextureViewDescriptor::default());
+    (t, v)
 }
